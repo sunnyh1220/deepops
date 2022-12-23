@@ -11,12 +11,14 @@
 //   Otherwise, the default in Jenkins should match the default here and that is used
 Map matrix_axes = [
   DEEPOPS_VAGRANT_OS: ['centos', 'ubuntu'],
-  DEEPOPS_OS_VERSION: ['', '18.04', '20.04', '7', '8'],
+  DEEPOPS_OS_VERSION: ['18.04', '20.04', '7', '8'],
   DEEPOPS_FULL_INSTALL: ['', 'multinode'],
   DEEPOPS_DEPLOYMENT_PLATFORM: ['slurm', 'k8s'],
   DEEPOPS_BRANCH: ['master'],
   DEEPOPS_REPO: ['https://github.com/NVIDIA/deepops.git'],
-  DEEPOPS_K8S_OPERATOR: ['', 'true']
+  DEEPOPS_K8S_OPERATOR: ['', 'true'],
+  DEEPOPS_K8S_OPERATOR_EXISTING_SOFTWARE: ['', 'true'],
+  DEEPOPS_K8S_CONTAINER_MANAGER: ['containerd', 'docker'] 
 ]
 
 // Override default values as specified by the manual builds with a special case for 'all'
@@ -35,6 +37,9 @@ if("$DEEPOPS_K8S_OPERATOR" != "all") {
 if("$DEEPOPS_OS_VERSION" != "all") {
   matrix_axes['DEEPOPS_OS_VERSION'] = ["$DEEPOPS_OS_VERSION"]
 }
+if("$DEEPOPS_K8S_OPERATOR_EXISTING_SOFTWARE" != "all") {
+  matrix_axes['DEEPOPS_K8S_OPERATOR_EXISTING_SOFTWARE'] = ["$DEEPOPS_K8S_OPERATOR_EXISTING_SOFTWARE"]
+}
 
 // Special case for branch and repo, these cannot be blank
 if("$DEEPOPS_BRANCH" != "") {
@@ -42,6 +47,10 @@ if("$DEEPOPS_BRANCH" != "") {
 }
 if("$DEEPOPS_REPO" != "") {
   matrix_axes['DEEPOPS_REPO'] = ["$DEEPOPS_REPO"]
+}
+
+if("$DEEPOPS_K8S_CONTAINER_MANAGER" != "all") {
+  matrix_axes['DEEPOPS_K8S_CONTAINER_MANAGER'] = ["$DEEPOPS_K8S_CONTAINER_MANAGER"]
 }
 
 // Default values
@@ -114,6 +123,11 @@ for(int i = 0; i < axes.size(); i++) {
                 bash -x ./workloads/jenkins/scripts/test-setup-slurm.sh
               '''
 
+              echo "Get Slurm Cluster Status"
+              sh '''
+                bash -x ./workloads/jenkins/scripts/get-slurm-debug.sh
+              '''
+
               echo "Verify we can run a basic Slurm job"
               sh '''
                 timeout 60 bash -x ./workloads/jenkins/scripts/test-slurm-job.sh
@@ -161,6 +175,11 @@ for(int i = 0; i < axes.size(); i++) {
               sh '''
                 timeout 120 bash -x ./workloads/jenkins/scripts/test-slurm-enroot-job.sh
               '''
+
+              echo "Test DCGM metrics"
+              sh '''
+                timeout 500 bash -x ./workloads/jenkins/scripts/test-dcgm-metrics.sh slurm-node
+              '''
             }  
           }
 
@@ -174,6 +193,11 @@ for(int i = 0; i < axes.size(); i++) {
               echo "Verify ingress config"
               sh '''
                 bash -x ./workloads/jenkins/scripts/verify-ingress-config.sh
+              '''
+
+              echo "Test running a Deep Learning Example"
+              sh '''
+                timeout 1200 bash -x ./workloads/jenkins/scripts/test-dle-deployment.sh
               '''
 
               echo "Test Kubeflow installation"
@@ -197,16 +221,23 @@ for(int i = 0; i < axes.size(); i++) {
               '''
             }
           }
-        }
-        // TODO: There seems to be a bug here if tasks fail, they do not get cleaned up properly
-        // XXX: Not sure if the cleanup should live inside or outside of the lock. Also, this doesn't seem to work.
-        post {
-          always {
-            echo "Final cleanup"
-            sh '''
-              pwd
-              cd virtual && ./vagrant_shutdown.sh
-            '''
+          stage("cleanup-${DEEPOPS_DEPLOYMENT_PLATFORM}-${DEEPOPS_VAGRANT_OS}-${DEEPOPS_FULL_INSTALL}") {
+              echo "Reset repo and unmunge files"
+              sh '''
+                git reset --hard
+                rm -rf config
+              '''
+
+              echo "Munge files for testing"
+              sh '''
+                bash -x ./workloads/jenkins/scripts/munge-files.sh
+              '''
+
+              echo "Tear down any Vagrant that was not cleaned up"
+              sh '''
+                pwd
+                cd virtual && ./vagrant_shutdown.sh || true
+              '''
           }
         }
       }

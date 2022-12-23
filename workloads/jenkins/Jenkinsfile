@@ -3,6 +3,7 @@ pipeline {
   environment {
     DEEPOPS_FULL_INSTALL = ''
     DEEPOPS_VAGRANT_OS = 'ubuntu'
+    DEEPOPS_OS_VERSION = '20.04'
   }
   stages {
     stage('Stop Any Old Builds') {
@@ -24,6 +25,12 @@ pipeline {
           echo "Munge files for testing"
           sh '''
             bash -x ./workloads/jenkins/scripts/munge-files.sh
+          '''
+
+          echo "Tear down any Vagrant that was not cleaned up"
+	    sh '''
+	    pwd
+	    cd virtual && ./vagrant_shutdown.sh || true
           '''
 
           echo "Vagrant Up"
@@ -76,9 +83,19 @@ pipeline {
             timeout 180 bash -x ./workloads/jenkins/scripts/test-dashboard.sh
           '''
 
+          echo "Start new virtual environment pre-Slurm checks"
+          sh '''
+            bash -x ./workloads/jenkins/scripts/vagrant-startup.sh
+          '''
+
           echo "Set up Slurm"
           sh '''
             bash -x ./workloads/jenkins/scripts/test-setup-slurm.sh
+          '''
+
+          echo "Get Slurm Cluster Status"
+          sh '''
+            bash -x ./workloads/jenkins/scripts/get-slurm-debug.sh
           '''
 
           echo "Test Slurm"
@@ -109,6 +126,11 @@ pipeline {
           echo "Test GPU job"
           sh '''
             timeout 60 bash -x ./workloads/jenkins/scripts/test-slurm-gpu.sh
+          '''
+
+          echo "Test DCGM metrics"
+          sh '''
+             timeout 600 bash -x ./workloads/jenkins/scripts/test-dcgm-metrics.sh slurm-node
           '''
         }
       }

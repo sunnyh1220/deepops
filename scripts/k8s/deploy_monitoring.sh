@@ -11,6 +11,9 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 ROOT_DIR="${SCRIPT_DIR}/../.."
 cd "${ROOT_DIR}" || exit 1
 
+# Source common libraries and env variables
+source ${ROOT_DIR}/scripts/common.sh
+
 # Allow overriding config dir to look in
 DEEPOPS_CONFIG_DIR=${DEEPOPS_CONFIG_DIR:-"${ROOT_DIR}/config"}
 
@@ -21,11 +24,14 @@ if [ ! -d "${DEEPOPS_CONFIG_DIR}" ]; then
 fi
 
 HELM_CHARTS_REPO_PROMETHEUS="${HELM_CHARTS_REPO_PROMETHEUS:-https://prometheus-community.github.io/helm-charts}"
-HELM_PROMETHEUS_CHART_VERSION="${HELM_PROMETHEUS_CHART_VERSION:-10.0.2}"
+HELM_PROMETHEUS_CHART_VERSION="${HELM_PROMETHEUS_CHART_VERSION:-39.5.0}"
 ingress_name="ingress-nginx"
 
 PROMETHEUS_YAML_CONFIG="${PROMETHEUS_YAML_CONFIG:-${DEEPOPS_CONFIG_DIR}/helm/monitoring.yml}"
 PROMETHEUS_YAML_NO_PERSIST_CONFIG="${PROMETHEUS_YAML_NO_PERSIST_CONFIG:-${DEEPOPS_CONFIG_DIR}/helm/monitoring-no-persist.yml}"
+DCGM_CONFIG_CSV="${DCGM_CONFIG_CSV:-${DEEPOPS_CONFIG_DIR}/files/k8s-cluster/dcgm-custom-metrics.csv}"
+
+GPU_OPERATOR_NAMESPACE="${GPU_OPERATOR_NAMESPACE:-gpu-operator-resources}"
 
 function help_me() {
     echo "This script installs the DCGM exporter, Prometheus, Grafana, and configures a GPU Grafana dashboard."
@@ -36,27 +42,32 @@ function help_me() {
     echo "-p      Print monitoring URLs."
     echo "-d      Delete monitoring namespace and crds. Note, this may delete PVs storing prometheus metrics."
     echo "-x      Disable persistent data, this deploys Prometheus with no PV backing resulting in a loss of data across reboots."
+    echo "-w      Wait and poll the grafana/prometheus/alertmanager URLs until they properly return."
     echo "delete  Legacy positional argument for delete. Same as -d flag."
 }
 
 function get_opts() {
-    while getopts "hdpx" option; do
+    while getopts "hdpxw" option; do
         case $option in
             d)
                 delete_monitoring
+                exit 0
+                ;;
+            p)
+                print_monitoring
                 exit 0
                 ;;
             h)
                 help_me
                 exit 1
                 ;;
-            p)
-                print_monitoring
-                exit 0
-                ;;
             x)
 		PROMETHEUS_YAML_CONFIG="${PROMETHEUS_YAML_NO_PERSIST_CONFIG}"
 		PROMETHEUS_NO_PERSIST="true"
+                ;;
+            w)
+                poll_monitoring_url
+                exit 0
                 ;;
             * )
                 # Leave this here to preserve legacy positional args behavior
@@ -77,6 +88,8 @@ function delete_monitoring() {
     helm uninstall kube-prometheus-stack -n monitoring
     helm uninstall "${ingress_name}"
     helm uninstall "nginx-ingress" # Delete legacy naming
+    helm uninstall "ingress-nginx" # Delete legacy namespace
+    helm uninstall "ingress-nginx" -n deepops-ingress
     kubectl delete crd prometheuses.monitoring.coreos.com
     kubectl delete crd prometheusrules.monitoring.coreos.com
     kubectl delete crd servicemonitors.monitoring.coreos.com
@@ -130,7 +143,7 @@ function setup_prom_monitoring() {
         kubectl create ns monitoring
     fi
     if ! helm status -n monitoring kube-prometheus-stack >/dev/null 2>&1 ; then
-        helm install \
+        helm upgrade --install \
             kube-prometheus-stack \
             prometheus-community/kube-prometheus-stack \
             --version "${HELM_PROMETHEUS_CHART_VERSION}" \
@@ -139,16 +152,24 @@ function setup_prom_monitoring() {
             --set alertmanager.ingress.hosts[0]="alertmanager-${ingress_ip_string}" \
             --set prometheus.ingress.hosts[0]="prometheus-${ingress_ip_string}" \
             --set grafana.ingress.hosts[0]="grafana-${ingress_ip_string}" \
+	    --timeout 1200s \
             ${helm_prom_oper_args} \
             ${helm_kube_prom_args}
     fi
 }
 
-function setup_gpu_monitoring() {
+function setup_gpu_monitoring_dashboard() {
     # Create GPU Dashboard config map
     if ! kubectl -n monitoring get configmap kube-prometheus-grafana-gpu >/dev/null 2>&1 ; then
         kubectl create configmap kube-prometheus-grafana-gpu --from-file=${ROOT_DIR}/src/dashboards/gpu-dashboard.json -n monitoring
         kubectl -n monitoring label configmap kube-prometheus-grafana-gpu grafana_dashboard=1
+    fi
+}
+
+function setup_gpu_monitoring() {
+    # Create DCGM metrics config map
+    if ! kubectl -n monitoring get configmap dcgm-custom-metrics >/dev/null 2>&1 ; then
+        kubectl create configmap dcgm-custom-metrics --from-file=${DCGM_CONFIG_CSV} -n monitoring
     fi
 
     # Label GPU nodes
@@ -233,10 +254,38 @@ function install_dependencies() {
 }
 
 
+function poll_monitoring_url() {
+    print_monitoring
+
+    while true; do
+        curl -s --raw -L "${prometheus_url}"     | grep Prometheus && \
+        curl -s --raw -L "${grafana_url}"      | grep Grafana && \
+        curl -s --raw -L "${alertmanager_url}" | grep Alertmanager && \
+        echo "Monitoring URLs are all responding" && \
+        break
+        sleep 10
+    done
+}
+
+
 get_opts ${@}
 
+# Install deps
 install_dependencies
 
+# Install Prom
 setup_prom_monitoring
-setup_gpu_monitoring
+
+# Install DCGM-Exporter and setup custom metrics, if needed
+# # GPU Device Plugin is installed into kube-system, GPU Operator installs it into gpu-operator-resources, use uniq for HA K8s clusters
+plugin_namespace=$( kubectl get pods -A -l app.kubernetes.io/instance=nvidia-device-plugin  --no-headers   --no-headers -o custom-columns=NAMESPACE:.metadata.namespace | uniq)
+if [ "${plugin_namespace}" == "kube-system" ] ; then
+    # No GPU Operator DCGM-Exporter Stack
+    setup_gpu_monitoring
+fi
+
+# Install custom gpu dashboards
+setup_gpu_monitoring_dashboard
+
+# Print URL outputs
 print_monitoring
